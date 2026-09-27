@@ -17,8 +17,9 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport/internet/browser"
 	"github.com/xtls/xray-core/transport/internet/tagged"
-	"golang.org/x/net/http2"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 const idleTimeout = 30 * time.Second
@@ -90,14 +91,18 @@ func newClient(baseCtx context.Context, dispatcher routing.Dispatcher, outbound 
 	}
 	if isHTTPS {
 		return &http.Client{
-			Transport: &http2.Transport{
-				DialTLSContext: func(ctx context.Context, network string, address string, cfg *tls.Config) (net.Conn, error) {
+			Transport: browser.ProfileForFingerprint("chrome").NewDialTransport(
+				func(ctx context.Context, network string, address string, cfg *tls.Config) (net.Conn, error) {
 					conn, err := dial(ctx, network, address)
 					if err != nil {
 						return nil, err
 					}
 					host, _, _ := net.SplitHostPort(address)
-					tlsConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+					tlsConn, err := xtls.NewUConn(conn, &utls.Config{ServerName: host}, &xtls.DefaultFingerprint)
+					if err != nil {
+						conn.Close()
+						return nil, err
+					}
 					handshakeCtx, cancel := context.WithTimeout(ctx, idleTimeout)
 					defer cancel()
 					if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
@@ -106,7 +111,7 @@ func newClient(baseCtx context.Context, dispatcher routing.Dispatcher, outbound 
 					}
 					return tlsConn, nil
 				},
-			},
+			),
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if req.URL.Scheme != "https" {
 					return errors.New("redirected to non-https URL: ", req.URL.String())

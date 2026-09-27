@@ -214,10 +214,15 @@ func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]b
 						if err != nil {
 							return nil, err
 						}
-						conn = utls.UClient(conn, &utls.Config{ServerName: u.Hostname()}, utls.HelloChrome_Auto)
-						if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
+						uConn, err := NewUConn(conn, &utls.Config{ServerName: u.Hostname()}, &DefaultFingerprint)
+						if err != nil {
+							conn.Close()
 							return nil, err
 						}
+						if err := uConn.HandshakeContext(ctx); err != nil {
+							return nil, err
+						}
+						conn = uConn
 					}
 					return conn, nil
 				},

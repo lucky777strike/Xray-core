@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/browser"
 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
@@ -32,7 +33,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/pipe"
-	"golang.org/x/net/http2"
 )
 
 type dialerConf struct {
@@ -252,13 +252,24 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
 		}
-		transport = &http2.Transport{
-			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
-				return dialContext(ctxInner)
-			},
-			IdleConnTimeout: net.ConnIdleTimeout,
-			ReadIdleTimeout: keepAlivePeriod,
+		var fingerprint string
+		if realityConfig != nil {
+			fingerprint = realityConfig.Fingerprint
+		} else if tlsConfig != nil {
+			fingerprint = tlsConfig.Fingerprint
 		}
+		h2Profile := browser.ProfileForFingerprint(fingerprint)
+		h2Transport := h2Profile.NewTransport()
+		h2Transport.DialTLSContext = func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
+			conn, err := dialContext(ctxInner)
+			if err != nil {
+				return nil, err
+			}
+			return h2Profile.Conn(conn), nil
+		}
+		h2Transport.IdleConnTimeout = net.ConnIdleTimeout
+		h2Transport.ReadIdleTimeout = keepAlivePeriod
+		transport = h2Transport
 	} else {
 		httpDialContext := func(ctxInner context.Context, network string, addr string) (net.Conn, error) {
 			return dialContext(ctxInner)

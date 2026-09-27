@@ -10,6 +10,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 )
@@ -74,9 +75,36 @@ func Server(c net.Conn, config *tls.Config) net.Conn {
 
 type UConn struct {
 	*utls.UConn
+	// presetErr is set when the fingerprint could not be applied, no byte may be sent then.
+	presetErr error
 }
 
 var _ Interface = (*UConn)(nil)
+
+func (c *UConn) Handshake() error {
+	return c.HandshakeContext(context.Background())
+}
+
+func (c *UConn) HandshakeContext(ctx context.Context) error {
+	if c.presetErr != nil {
+		return c.presetErr
+	}
+	return c.UConn.HandshakeContext(ctx)
+}
+
+func (c *UConn) Read(b []byte) (int, error) {
+	if c.presetErr != nil {
+		return 0, c.presetErr
+	}
+	return c.UConn.Read(b)
+}
+
+func (c *UConn) Write(b []byte) (int, error) {
+	if c.presetErr != nil {
+		return 0, c.presetErr
+	}
+	return c.UConn.Write(b)
+}
 
 func (c *UConn) Close() error {
 	timer := time.AfterFunc(tlsCloseTimeout, func() {
@@ -96,6 +124,9 @@ func (c *UConn) HandshakeContextServerName(ctx context.Context) string {
 // WebsocketHandshakeContext basically calls UConn.Handshake inside it but it will try
 // to build outer ALPN to `http/1.1` or `h2 http/1.1` (if manually specified for camouflage)
 func (c *UConn) WebsocketHandshakeContext(ctx context.Context) error {
+	if c.presetErr != nil {
+		return c.presetErr
+	}
 	config := *utils.AccessField[*utls.Config](c, "config")
 	ALPN := slices.Clone(config.NextProtos)
 	// set other kinds of ALPN to http/1.1
@@ -138,12 +169,40 @@ func (c *UConn) NegotiatedProtocol() string {
 }
 
 func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) net.Conn {
-	utlsConn := utls.UClient(c, copyConfig(config), *fingerprint)
-	return &UConn{UConn: utlsConn}
+	utlsConn, err := NewUConn(c, copyConfig(config), fingerprint)
+	return &UConn{UConn: utlsConn, presetErr: err}
 }
 
 func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
-	return utls.UClient(c, copyConfig(config), utls.HelloChrome_Auto)
+	uConn, err := NewUConn(c, copyConfig(config), &DefaultFingerprint)
+	if err != nil {
+		return utls.UClient(c, copyConfig(config), utls.HelloChrome_Auto)
+	}
+	return uConn
+}
+
+// customSpecs holds the fingerprints whose ClientHelloSpec is built by Xray instead of uTLS.
+// The factory is called once per connection.
+var customSpecs = map[utls.ClientHelloID]func() (*utls.ClientHelloSpec, error){
+	HelloChrome_152: chrome152Spec,
+}
+
+// NewUConn is utls.UClient that also understands Xray's own fingerprints (see customSpecs).
+// The returned UConn is never nil; on error its handshake must not be attempted.
+func NewUConn(c net.Conn, config *utls.Config, fingerprint *utls.ClientHelloID) (*utls.UConn, error) {
+	newSpec, ok := customSpecs[*fingerprint]
+	if !ok {
+		return utls.UClient(c, config, *fingerprint), nil
+	}
+	uConn := utls.UClient(c, config, utls.HelloCustom)
+	spec, err := newSpec()
+	if err == nil {
+		err = uConn.ApplyPreset(spec)
+	}
+	if err != nil {
+		return uConn, errors.New("failed to apply fingerprint ", fingerprint.Str()).Base(err)
+	}
+	return uConn, nil
 }
 
 func copyConfig(c *tls.Config) *utls.Config {
@@ -184,9 +243,13 @@ func init() {
 	PresetFingerprints["randomizednoalpn"] = &randomizednoalpn
 }
 
+// DefaultFingerprint is used when no fingerprint is configured and for Xray's own
+// outgoing TLS (DoH, ECH config queries, geodata download).
+var DefaultFingerprint = HelloChrome_152
+
 func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 	if name == "" {
-		return &utls.HelloChrome_Auto
+		return &DefaultFingerprint
 	}
 	if fingerprint = PresetFingerprints[name]; fingerprint != nil {
 		return
@@ -202,7 +265,7 @@ func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 
 var PresetFingerprints = map[string]*utls.ClientHelloID{
 	// Recommended preset options in GUI clients
-	"chrome":           &utls.HelloChrome_Auto,
+	"chrome":           &HelloChrome_152,
 	"firefox":          &utls.HelloFirefox_Auto,
 	"safari":           &utls.HelloSafari_Auto,
 	"ios":              &utls.HelloIOS_Auto,
@@ -223,6 +286,7 @@ var ModernFingerprints = map[string]*utls.ClientHelloID{
 	"hellochrome_120":  &utls.HelloChrome_120,
 	"hellochrome_131":  &utls.HelloChrome_131,
 	"hellochrome_133":  &utls.HelloChrome_133,
+	"hellochrome_152":  &HelloChrome_152,
 	"helloios_13":      &utls.HelloIOS_13,
 	"helloios_14":      &utls.HelloIOS_14,
 	"helloedge_106":    &utls.HelloEdge_106,

@@ -29,9 +29,9 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/transport/internet/browser"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/crypto/hkdf"
-	"golang.org/x/net/http2"
 )
 
 type Conn struct {
@@ -134,9 +134,14 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	if fingerprint == nil {
 		return nil, errors.New("REALITY: failed to get fingerprint")
 	}
-	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	var err error
+	if uConn.UConn, err = tls.NewUConn(c, utlsConfig, fingerprint); err != nil {
+		return nil, errors.New("REALITY: ").Base(err)
+	}
 	{
-		uConn.BuildHandshakeState()
+		if err := uConn.BuildHandshakeState(); err != nil {
+			return nil, errors.New("REALITY: failed to build ClientHello").Base(err)
+		}
 		hello := uConn.HandshakeState.Hello
 		hello.SessionId = make([]byte, 32)
 		copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
@@ -158,7 +163,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
 		}
 		if ecdhe == nil {
-			return nil, errors.New("Current fingerprint ", uConn.ClientHelloID.Client, uConn.ClientHelloID.Version, " does not support TLS 1.3, REALITY handshake cannot establish.")
+			return nil, errors.New("Current fingerprint ", fingerprint.Client, fingerprint.Version, " does not support TLS 1.3, REALITY handshake cannot establish.")
 		}
 		uConn.AuthKey, _ = ecdhe.ECDH(publicKey)
 		if uConn.AuthKey == nil {
@@ -183,16 +188,15 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
 		go func() {
-			client := &http.Client{
-				Transport: &http2.Transport{
-					DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
-						if config.Show {
-							fmt.Printf("REALITY localAddr: %v\tDialTLSContext\n", localAddr)
-						}
-						return uConn, nil
-					},
-				},
+			h2Profile := browser.ProfileForFingerprint(config.Fingerprint)
+			transport := h2Profile.NewTransport()
+			transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
+				if config.Show {
+					fmt.Printf("REALITY localAddr: %v\tDialTLSContext\n", localAddr)
+				}
+				return h2Profile.Conn(uConn), nil
 			}
+			client := &http.Client{Transport: transport}
 			prefix := []byte("https://" + uConn.ServerName)
 			maps.Lock()
 			if maps.maps == nil {
